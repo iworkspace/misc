@@ -25,10 +25,10 @@
 
 
 int sock_g = -1;
-
+int loglevel = 0;
 
 int usage(char *prog,int ret){
-  printf("%s [ -i dev ] [ -b bpf_rule_file ]  \n",prog);
+  printf("%s [ -i dev ] [ -b bpf_rule_file ] [ -l loglevel ] \n",prog);
   return ret;
 }
 
@@ -82,8 +82,87 @@ int  raw_socket_zero_copy_setup(struct iovec *ring,int blocksize,int framesize)
     return ;
   }
 
-  while
+}
 
+/**
+ *
+ *
+[test]# tcpdump -ddd -nn -i any ip
+4
+40 0 0 14
+21 0 1 2048
+6 0 0 262144
+6 0 0 0
+[test]#
+[test]# tcpdump -dd -nn -i any ip
+{ 0x28, 0, 0, 0x0000000e },
+{ 0x15, 0, 1, 0x00000800 },
+{ 0x6, 0, 0, 0x00040000 },
+{ 0x6, 0, 0, 0x00000000 },
+
+ */
+
+int apply_bpf_rule(char *bpf_file){
+  struct sock_fprog fprog;
+  struct sock_filter *filter = NULL;
+  int ret = -1;
+  FILE *bpf_f= fopen(bpf_file);
+  if(!bpf_f){
+    goto end;
+  }
+
+  if(1!=fscanf(bpf_f,"%d\n",&fprog.len)){
+    goto end;
+  }
+
+  filter = malloc(sizeof(*filter)*(fprog.len+1));
+  if(!filter){
+    goto end;
+  }
+
+  int i;
+  for(i=0;i<fprog.len;i++){
+    if( 4 != fscanf(bpf_f,"%d %d %d %d\n",
+          &filter[i].code,
+          &filter[i].jt,
+          &filter[i].jf,
+          &filter[i].k)){
+        goto end;
+    }
+  }
+  fprog.filter = filter;
+
+  if(setsockopt(sock_g,SO_LSOCKET,SO_ATTACH_FILTER,&fprog,sizeof(fprog))){
+    goto end;
+  }
+
+  ret = 0;
+end:
+  if(filter){
+      free(filter);
+  }
+  if(bpf_f){
+    fclose(bpf_f);
+  }
+  return ret;
+}
+
+int main_loop()
+{
+  fd_set rset;
+  struct iovec rx_rx
+  if(raw_socket_zero_copy_setup(struct iovec *ring,int blocksize,int framesize)){
+      return -1;
+  }
+  for(;;){
+    FD_CLEAR(&rset);
+    FD_SET(sock_g,&rset);
+    if(1== select(sock_g+1,&rset,NULL,NULL,NULL)){
+        walk_rx_ring();
+    }else{
+      break;
+    }
+  }
 }
 
 int
@@ -93,13 +172,16 @@ main(int argc, char *argv[])
     char *ifname = NULL;
     char *bpf_files = NULL;
 
-    while ((opt = getopt(argc, argv, "i:b:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:b:i:h")) != -1) {
         switch (opt) {
         case 'i':
             ifname = strdup(optarg);
             break;
         case 'b':
             bpf_files = strdup(optarg);
+            break;
+        case 'l':
+            loglevel = atoi(optarg);
             break;
         case 'h':
             return usage(argv[0],0);
