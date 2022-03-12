@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <poll.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -18,9 +19,10 @@
 
 int sock_g = -1;
 int loglevel = 0;
+int timeout_ms = 3000;
 
 int usage(char *prog,int ret){
-  printf("%s [ -i dev ] [ -b bpf_rule_file ] [ -l loglevel ] \n",prog);
+  printf("%s [ -i dev ] [ -b bpf_rule_file ] [ -l loglevel ] [ -t timeout_ms ]\n",prog);
   return ret;
 }
 
@@ -118,37 +120,31 @@ int  raw_socket_zero_copy_setup(struct iovec **ring,int *ring_size,int max_frame
 {
   //use zero copy raw packet walk...
   void *ring_map_addr;
-  struct tpacket_req3 req = {};
+  struct tpacket_req req;
   int i;
-  int val = TPACKET_V3;
-  int pagesize;
+  int val = TPACKET_V2;
   int blocksize;
   int block_nr;
   int framesize;
   int frame_nr;
-  int frame_nr_on_block;
 
   if(setsockopt(sock_g,SOL_PACKET,PACKET_VERSION,&val,sizeof(val))){
     fprintf(stderr,"set packet version 2 err\n");
     return -1;
   }
 
-  /*
-   *   
-   tp_block_size must be a multiple of PAGE_SIZE (1)
-   tp_frame_size must be greater than TPACKET_HDRLEN (obvious)
-   tp_frame_size must be a multiple of TPACKET_ALIGNMENT
-   tp_frame_nr   must be exactly frames_per_block*tp_block_nr
-   * */
-  pagesize = getpagesize();
-
-  framesize = TPACKET_ALIGN(max_frame);
-  blocksize = (framesize+pagesize-1)&(~(pagesize-1));
-  frame_nr_on_block = blocksize/framesize;
-  frame_nr = (*ring_size + frame_nr_on_block -1) & (~(frame_nr_on_block-1));
-  block_nr = frame_nr/frame_nr_on_block;
-  *ring_size = block_nr;
-
+#if 0
+  framesize = (max_frame+0xf)&(~0xf);
+  //val = *ring*framesize; 
+  //todo aligned frame(16) and block(4k/2k) least comman multiple
+  blocksize = (max_frame+0x7ff)&(~0x7ff);
+  block_nr=frame_nr=*ring_size;
+#endif
+  framesize = 2048;
+  blocksize = 4096;
+  block_nr = 0x100;
+  frame_nr = 0x200;
+  *ring_size = 0x200;
   req.tp_block_size = blocksize ; /* PAGE_ALIGNED > frame size*/
   req.tp_frame_size = framesize ; /* TAPCKET_ALIGNMENT  */
   req.tp_block_nr = block_nr ;
@@ -170,9 +166,15 @@ int  raw_socket_zero_copy_setup(struct iovec **ring,int *ring_size,int max_frame
     fprintf(stderr,"malloc iovec arry err\n");
     return -1;
   }
+#if 0
   for(i=0;i<req.tp_block_nr;i++){
     (*ring)[i].iov_base = ring_map_addr + (i*req.tp_block_size);
     (*ring)[i].iov_len = req.tp_block_size;
+  }
+#endif
+ for(i=0;i<req.tp_frame_nr;i++){
+    (*ring)[i].iov_base = ring_map_addr + (i*req.tp_frame_size);
+    (*ring)[i].iov_len = req.tp_frame_size;
   }
 
   return 0;
@@ -183,7 +185,7 @@ void hexdump(unsigned char *addr,int len)
   int i;
   for(i=0;i<len;){
     if(i%16 == 0)
-    printf("%04x: ",addr+i);
+    printf("%4x: ",addr+i);
     printf("%02x ",addr[i]);
     i++;
     if(i%16 == 0)
@@ -196,32 +198,33 @@ void hexdump(unsigned char *addr,int len)
 void walk_rx_ring(struct iovec *rx_ring,int ring_size,int *last)
 {
   int i ;
-  struct tpacket3_hdr *h;
-  struct tpacket_block_desc *pbd;
+  struct tpacket2_hdr *h;
   unsigned char *mac_hdr;
+  static int count = 0;
 
   for(i=*last;i<ring_size;){
-    pbd = rx_ring[i].iov_base;
+    h = rx_ring[i].iov_base;
 
-    if(!pbd->hdr.bh1.block_status&TP_STATUS_USER){
+    if(!h->tp_status&TP_STATUS_USER){
       *last = i;
       break;
     }
-    
-    int j;
-    for(j =0,h = (void*)pbd+pbd->hdr.bh1.offset_to_first_pkt; j< pbd->hdr.bh1.num_pkts;j++){
-      mac_hdr = (void*)h+h->tp_mac;
-      //dump
-      if(loglevel>9){
-       hexdump(mac_hdr,h->tp_snaplen);
-      }
-      h = (void*)h + h->tp_next_offset;
+
+    mac_hdr = (void*)h+h->tp_mac;
+    //dump
+    if(loglevel>9){
+      printf("%d packet capture.\n",count++);
+      hexdump(mac_hdr,h->tp_snaplen);
     }
-    pbd->hdr.bh1.block_status = TP_STATUS_KERNEL;
+
+    
+
+    h->tp_status = TP_STATUS_KERNEL;
     __sync_synchronize();
     if(++i == ring_size)
       i = 0;
   }
+
 }
 
 int main_loop()
@@ -230,6 +233,7 @@ int main_loop()
   struct iovec *rx_ring;
   int ring_size = 0x100;
   int last = 0;
+  struct timeval timeout;
 
   if(raw_socket_zero_copy_setup(&rx_ring,&ring_size,0x800)){
       return -1;
@@ -238,10 +242,22 @@ int main_loop()
   for(;;){
     FD_ZERO(&rset);
     FD_SET(sock_g,&rset);
-    if(1== select(sock_g+1,&rset,NULL,NULL,NULL)){
+    timeout.tv_sec = timeout_ms/1000;
+    timeout.tv_usec = (timeout_ms%1000)*1000;
+
+    if(1== select(sock_g+1,&rset,NULL,NULL,&timeout)){
         walk_rx_ring(rx_ring,ring_size,&last);
     }else{
-      break;
+      //timeout
+      struct tm tm_now;
+      char buf_now[128];
+      struct timeval time_now ;
+      gettimeofday(&time_now,NULL);
+      gmtime_r(&time_now.tv_sec,&tm_now);
+      strftime(buf_now,128,">>--%F_%T",&tm_now);
+      printf("detect two pkt timeout,info  %s.%03d \n",
+        buf_now,time_now.tv_usec/1000);
+      continue;
     }
   }
 }
@@ -253,7 +269,7 @@ main(int argc, char *argv[])
     char *ifname = NULL;
     char *bpf_files = NULL;
 
-    while ((opt = getopt(argc, argv, "i:b:l:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:b:l:t:h")) != -1) {
         switch (opt) {
         case 'i':
             ifname = strdup(optarg);
@@ -263,6 +279,9 @@ main(int argc, char *argv[])
             break;
         case 'l':
             loglevel = atoi(optarg);
+            break;
+        case 't':
+            timeout_ms = atoi(optarg);
             break;
         case 'h':
             return usage(argv[0],0);
